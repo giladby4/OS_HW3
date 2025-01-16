@@ -10,7 +10,7 @@ typedef struct Threads_stats{
 } * threads_stats;
 
 // handle a request
-void requestHandle(int fd, struct timeval arrival, struct timeval dispatch, threads_stats t_stats);
+int requestHandle(int fd, struct timeval arrival, struct timeval dispatch, threads_stats t_stats);
 
 //  Returns True/False if realtime event
 int getRequestMetaData(int fd);

@@ -43,6 +43,18 @@ typedef struct {
 } thread_pool;
 
 
+void printQueueState(thread_pool *pool) {
+    int i = pool->get_queue_front;
+    printf("Front: %d, Rear: %d, Size: %d\n", pool->get_queue_front, pool->get_queue_rear, pool->get_queue_size);
+    printf("Queue contents: ");
+    for (int j = 0; j < pool->get_queue_size; j++) {
+        printf("%d ", pool->get_queue[i].connfd);  // Print job connfd or another identifier
+        i = (i + 1) % pool->max_queue_size;
+    }
+    printf("\n");
+    fflush(stdout);  // Ensure it gets printed immediately
+
+}
 void *worker_thread(void *arg) {
     thread_pool *pool = (thread_pool *)arg;  // Get the thread pool from the argument
     job_t job;  // Variable to hold the job
@@ -84,13 +96,28 @@ void *worker_thread(void *arg) {
         t_stats->total_req = 0;
 
         // Process the job (e.g., handle the connection)
-        requestHandle(job.connfd, arrival, dispatch, t_stats);
+        int is_skip=requestHandle(job.connfd, arrival, dispatch, t_stats);
+        if (is_skip){
+            pthread_mutex_lock(&pool->queue_lock);
 
-        // Free the memory allocated for the stats object
+            if (pool->get_queue_size > 0) {
+                // Get the rear job
+                job_t rear_job = pool->get_queue[(pool->get_queue_rear-1+ pool->max_queue_size) % pool->max_queue_size];
+
+                // Move it to the front
+                pool->get_queue_front = (pool->get_queue_front - 1 + pool->max_queue_size) % pool->max_queue_size;
+                pool->get_queue[pool->get_queue_front] = rear_job;
+                // Adjust the rear pointer (wrap-around using modulo)
+                pool->get_queue_rear = (pool->get_queue_rear - 1 + pool->max_queue_size) % pool->max_queue_size;
+            }
+
+            pthread_cond_signal(&pool->get_queue_not_empty);  // Wake up any waiting worker thread
+
+            pthread_mutex_unlock(&pool->queue_lock);
+        }
         free(t_stats);
-
-        // Optionally, you can close the connection if no further communication is required
         close(job.connfd);
+
     }
     
 
@@ -160,7 +187,7 @@ void add_job_to_queue(thread_pool *pool, job_t job, int is_vip) {
     pthread_mutex_lock(&pool->queue_lock);
     if(is_vip){
         // Wait if the queue is full
-        while (pool->real_queue_size == pool->max_queue_size) {
+        while (pool->real_queue_size+pool->get_queue_size == pool->max_queue_size) {
             pthread_cond_wait(&pool->real_queue_not_full, &pool->queue_lock);
         }
     
@@ -174,7 +201,7 @@ void add_job_to_queue(thread_pool *pool, job_t job, int is_vip) {
     }
     else{
 
-        while (pool->get_queue_size == pool->max_queue_size) {
+        while (pool->get_queue_size+pool->real_queue_size == pool->max_queue_size) {
             pthread_cond_wait(&pool->get_queue_not_full, &pool->queue_lock);
         }
 

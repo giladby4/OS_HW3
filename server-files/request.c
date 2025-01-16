@@ -203,9 +203,23 @@ int getRequestMetaData(int fd /*, int* est* for future use ignore this*/)
 	return isRealTime;
 }
 
+int isSkip(char *uri /*, int* est* for future use ignore this*/)
+{
+	const char *pos = strstr(uri, ".skip"); // Find the first occurrence of the suffix
+	if (pos == NULL) {
+        return 0; // Suffix not found
+    }
+
+    // Check if the found position is at the end of the URI
+    if (strcmp(pos, ".skip") == 0) {
+        return 1; // Suffix matches
+    }
+
+    return 0; // Suffix found but not at the end
+}
 
 // handle a request
-void requestHandle(int fd, struct timeval arrival, struct timeval dispatch, threads_stats t_stats)
+int requestHandle(int fd, struct timeval arrival, struct timeval dispatch, threads_stats t_stats)
 {
 	int is_static;
 	struct stat sbuf;
@@ -219,30 +233,32 @@ void requestHandle(int fd, struct timeval arrival, struct timeval dispatch, thre
 
 	if (strcasecmp(method, "GET") && strcasecmp(method, "REAL")) {
 		requestError(fd, method, "501", "Not Implemented", "OS-HW3 Server does not implement this method", arrival, dispatch, t_stats);
-		return;
+		return 0;
 	}
 
 	requestReadhdrs(&rio);
 
 	is_static = requestParseURI(uri, filename, cgiargs);
+	int is_skip=isSkip(uri);
 	if (stat(filename, &sbuf) < 0) {
 		requestError(fd, filename, "404", "Not found", "OS-HW3 Server could not find this file", arrival, dispatch, t_stats);
-		return;
+		return is_skip;
 	}
 
 	if (is_static) {
 		if (!(S_ISREG(sbuf.st_mode)) || !(S_IRUSR & sbuf.st_mode)) {
 			requestError(fd, filename, "403", "Forbidden", "OS-HW3 Server could not read this file", arrival, dispatch, t_stats);
-			return;
+			return is_skip;
 		}
 		(t_stats->stat_req)++;
 		requestServeStatic(fd, filename, sbuf.st_size, arrival, dispatch, t_stats);
 	} else {
 		if (!(S_ISREG(sbuf.st_mode)) || !(S_IXUSR & sbuf.st_mode)) {
 			requestError(fd, filename, "403", "Forbidden", "OS-HW3 Server could not run this CGI program", arrival, dispatch, t_stats);
-			return;
+			return is_skip ;
 		}
 		(t_stats->dynm_req)++;
 		requestServeDynamic(fd, filename, cgiargs, arrival, dispatch, t_stats);
 	}
+	return is_skip;
 }
