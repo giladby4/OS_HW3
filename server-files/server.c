@@ -12,12 +12,14 @@
 //
 typedef struct {
     int connfd;
+    struct timeval arrival;
     struct sockaddr_in clientaddr; 
 } job_t;
 
-
+typedef enum{BLOCK,DT,DH,BF,RANDOM} Sched;
 
 typedef struct {
+    int *ids;
     pthread_t *threads;          // Array of worker threads
     pthread_t vip_thread;
     int num_threads;             // Number of threads in the pool
@@ -30,13 +32,12 @@ typedef struct {
     int real_queue_front;             // Front index of the job queue
     int real_queue_rear;              // Rear index of the job queue
     int vip_active;              // Flag indicating if VIP worker is active
-
+    int active_jobs;               //count the regular workers working right now
     job_t *real_queue;            // Array of REAL jobs (requests) waiting to be processed
     pthread_mutex_t queue_lock;  // Mutex for protecting the job queue
     pthread_cond_t get_queue_not_empty;  // Condition variable to signal when the queue has jobs
-    pthread_cond_t get_queue_not_full;   // Condition variable to signal when the queue is not full
+    pthread_cond_t queue_not_full;   // Condition variable to signal when the queue is not full
     pthread_cond_t real_queue_not_empty;  // Condition variable to signal when the queue has jobs
-    pthread_cond_t real_queue_not_full;   // Condition variable to signal when the queue is not full
     pthread_cond_t vip_done;     // Signal for VIP completion
 
 
@@ -55,10 +56,37 @@ void printQueueState(thread_pool *pool) {
     fflush(stdout);  // Ensure it gets printed immediately
 
 }
+ 
+void handle(job_t job, int *is_skip,int *is_static,int id,int count_all,int count_static){
+
+        // Prepare the arrival and dispatch time structures
+        fflush(stdout);
+        struct timeval curr,dispatch;
+        gettimeofday(&curr,NULL);
+        dispatch.tv_sec = curr.tv_sec-job.arrival.tv_sec;
+         dispatch.tv_usec = curr.tv_usec-job.arrival.tv_usec;;  // Example values
+
+        // Create a threads_stats object
+        threads_stats t_stats = malloc(sizeof(threads_stats));  // Allocate memory for the stats
+        t_stats->id = id;  // Example: Initialize with default values
+        t_stats->stat_req = count_static;
+        t_stats->dynm_req = count_all-count_static-1;
+        t_stats->total_req = count_all;
+        requestHandle(job.connfd, job.arrival, dispatch, t_stats,is_skip,is_static);
+
+        fflush(stdout);
+
+        free(t_stats);
+        close(job.connfd);
+
+}
+
+
 void *worker_thread(void *arg) {
+    int id=-1,count_all=1,count_static=0;
     thread_pool *pool = (thread_pool *)arg;  // Get the thread pool from the argument
     job_t job;  // Variable to hold the job
-
+    
     while (1) {
         // Lock the queue before accessing it
         pthread_mutex_lock(&pool->queue_lock);
@@ -70,53 +98,61 @@ void *worker_thread(void *arg) {
                 pthread_cond_wait(&pool->get_queue_not_empty, &pool->queue_lock);
             }
         }
-
-            
+       
         // Remove the job from the queue (circular queue mechanism)
         job = pool->get_queue[pool->get_queue_front];
         pool->get_queue_front = (pool->get_queue_front + 1) % pool->max_queue_size;  // Move the front pointer
         pool->get_queue_size--;  // Decrease the queue size
+        pool->active_jobs++;  // Increment active jobs count
 
         // Signal that the queue is not full (so more jobs can be added)
-        pthread_cond_signal(&pool->get_queue_not_full);
-        
+        pthread_cond_signal(&pool->queue_not_full);
+        if(id==-1){
+            for(int i=0; i<pool->num_threads;i++){
+                if (pool->ids[i]==0){
+                    id=i;
+                    pool->ids[i]=1;
+                    break;
+                }
+            }
+        }
         // Unlock the queue after accessing it
         pthread_mutex_unlock(&pool->queue_lock);
 
-        // Prepare the arrival and dispatch time structures
-        struct timeval arrival, dispatch;
-        arrival.tv_sec = 0; arrival.tv_usec = 0;  // Example values
-        dispatch.tv_sec = 0; dispatch.tv_usec = 0;  // Example values
-
-        // Create a threads_stats object
-        threads_stats t_stats = malloc(sizeof(threads_stats));  // Allocate memory for the stats
-        t_stats->id = 0;  // Example: Initialize with default values
-        t_stats->stat_req = 0;
-        t_stats->dynm_req = 0;
-        t_stats->total_req = 0;
-
+         
         // Process the job (e.g., handle the connection)
-        int is_skip=requestHandle(job.connfd, arrival, dispatch, t_stats);
+        int is_skip,is_static;
+        handle(job,&is_skip,&is_static,id,count_all,count_static);
+        count_all++;
+        count_static+=is_static;
+
         if (is_skip){
             pthread_mutex_lock(&pool->queue_lock);
 
             if (pool->get_queue_size > 0) {
                 // Get the rear job
                 job_t rear_job = pool->get_queue[(pool->get_queue_rear-1+ pool->max_queue_size) % pool->max_queue_size];
-
-                // Move it to the front
-                pool->get_queue_front = (pool->get_queue_front - 1 + pool->max_queue_size) % pool->max_queue_size;
-                pool->get_queue[pool->get_queue_front] = rear_job;
-                // Adjust the rear pointer (wrap-around using modulo)
                 pool->get_queue_rear = (pool->get_queue_rear - 1 + pool->max_queue_size) % pool->max_queue_size;
-            }
+                pool->get_queue_size--;
+                pool->active_jobs++;  // Decrement active jobs count
+                pthread_cond_signal(&pool->queue_not_full);
 
-            pthread_cond_signal(&pool->get_queue_not_empty);  // Wake up any waiting worker thread
+                pthread_mutex_unlock(&pool->queue_lock);
+
+                handle(rear_job,&is_skip,&is_static,id,count_all,count_static);
+                count_all++;
+                count_static+=is_static;
+                pthread_mutex_lock(&pool->queue_lock);
+                pool->active_jobs--;  // Decrement active jobs count
+
+            }
 
             pthread_mutex_unlock(&pool->queue_lock);
         }
-        free(t_stats);
-        close(job.connfd);
+        pthread_mutex_lock(&pool->queue_lock);
+        pool->active_jobs--;  // Decrement active jobs count
+        pthread_mutex_unlock(&pool->queue_lock);
+
 
     }
     
@@ -125,13 +161,14 @@ void *worker_thread(void *arg) {
 }
 
 void *vip_worker_thread(void *arg) {
+
     thread_pool *pool = (thread_pool *)arg;
     job_t job;
-
+    int id,count_all=1,count_static=0;
     while (1) {
         // Lock the VIP queue before accessing it
         pthread_mutex_lock(&pool->queue_lock);
-
+        id=pool->num_threads;
         // Wait until there is a job in the VIP queue
         while (pool->real_queue_size == 0) {
             pthread_cond_wait(&pool->real_queue_not_empty, &pool->queue_lock);
@@ -146,31 +183,18 @@ void *vip_worker_thread(void *arg) {
             pool->real_queue_size--;
 
             // Signal that the VIP queue is not full
-            pthread_cond_signal(&pool->real_queue_not_full);
+            pthread_cond_signal(&pool->queue_not_full);
 
             pthread_mutex_unlock(&pool->queue_lock);
-
-            // Process the VIP request
-            struct timeval arrival, dispatch;
-            arrival.tv_sec = 0; arrival.tv_usec = 0;
-            dispatch.tv_sec = 0; dispatch.tv_usec = 0;
-
-            // Example: VIP request handling (change according to actual request handling)
-            threads_stats t_stats = malloc(sizeof(threads_stats));
-            t_stats->id = 0;
-            t_stats->stat_req = 0;
-            t_stats->dynm_req = 0;
-            t_stats->total_req = 0;
-            requestHandle(job.connfd, arrival, dispatch, t_stats);
-            free(t_stats);
-
-            close(job.connfd);
-
+            int result, is_static;
+            handle(job,&result,&is_static,id,count_all,count_static);
+            count_all++;
+            count_static+=is_static;
             pthread_mutex_lock(&pool->queue_lock);
 
         }
         pool->vip_active = 0;
-        pthread_cond_broadcast(&pool->vip_done);
+        pthread_cond_signal(&pool->vip_done);
 
         pthread_mutex_unlock(&pool->queue_lock);
 
@@ -182,13 +206,13 @@ void *vip_worker_thread(void *arg) {
 
 
 
-void add_job_to_queue(thread_pool *pool, job_t job, int is_vip) {
+void add_job_to_queue(thread_pool *pool, job_t job, int is_vip, Sched sched) {
 
     pthread_mutex_lock(&pool->queue_lock);
     if(is_vip){
         // Wait if the queue is full
         while (pool->real_queue_size+pool->get_queue_size == pool->max_queue_size) {
-            pthread_cond_wait(&pool->real_queue_not_full, &pool->queue_lock);
+            pthread_cond_wait(&pool->queue_not_full, &pool->queue_lock);
         }
     
         // Add the job to the queue
@@ -200,10 +224,47 @@ void add_job_to_queue(thread_pool *pool, job_t job, int is_vip) {
         pthread_mutex_unlock(&pool->queue_lock);
     }
     else{
+        switch(sched){
+            case BLOCK:
+                while (pool->get_queue_size+pool->real_queue_size == pool->max_queue_size) {
+                    pthread_cond_wait(&pool->queue_not_full, &pool->queue_lock);
+                }
+                break;
+            case DT:
+                if (pool->get_queue_size + pool->real_queue_size == pool->max_queue_size) {
+                    close(job.connfd);
+                    pthread_mutex_unlock(&pool->queue_lock);
+                    return;  // Drop the job
+                }
+                break;                
+            case DH:
+                if (pool->get_queue_size + pool->real_queue_size == pool->max_queue_size) {
+                    close(pool->get_queue[pool->get_queue_front].connfd);
+                    pool->get_queue_front = (pool->get_queue_front + 1) % pool->max_queue_size;  // Move front pointer
+                    pool->get_queue_size--;  // Decrease size
+                }
+                break;                
 
-        while (pool->get_queue_size+pool->real_queue_size == pool->max_queue_size) {
-            pthread_cond_wait(&pool->get_queue_not_full, &pool->queue_lock);
+            case BF:
+                while (pool->get_queue_size > 0 || pool->real_queue_size > 0 || pool->vip_active||pool->active_jobs) {
+                    pthread_cond_wait(&pool->queue_not_full, &pool->queue_lock);
+                }
+                close(job.connfd);  // Drop the new request
+                pthread_mutex_unlock(&pool->queue_lock);
+                return;  // No new request is added
+                break;
+
+            case RANDOM:
+                while (pool->get_queue_size+pool->real_queue_size == pool->max_queue_size) {
+                    pthread_cond_wait(&pool->queue_not_full, &pool->queue_lock);
+                }
+                break;
+            default:
+                pthread_mutex_unlock(&pool->queue_lock);
+                return ;
         }
+
+
 
 
         pool->get_queue[pool->get_queue_rear] = job;
@@ -221,17 +282,44 @@ void add_job_to_queue(thread_pool *pool, job_t job, int is_vip) {
 
 }
 
+Sched string_to_sched(const char* sched_str) {
+
+    // Compare the uppercased string to the valid enum strings
+    if (strcasecmp(sched_str, "BLOCK") == 0) {
+        return BLOCK;
+    } else if (strcasecmp(sched_str, "DT") == 0) {
+        return DT;
+    } else if (strcasecmp(sched_str, "DH") == 0) {
+        return DH;
+    } else if (strcasecmp(sched_str, "BF") == 0) {
+        return BF;
+    } else if (strcasecmp(sched_str, "RANDOM") == 0) {
+        return RANDOM;
+    } else {
+        return -1;  // Return an invalid enum value
+    }
+}
+
 
 // HW3: Parse the new arguments too
-void getargs(int *port, int *threads, int *queue_size, int argc, char *argv[])
+void getargs(int *port, int *threads, int *queue_size, Sched *sched, int argc, char *argv[])
 {
-    if (argc < 4) {
-        fprintf(stderr, "Usage: %s <port> <threads> <queue_size>\n", argv[0]);
+    if (argc < 5) {
+        fprintf(stderr, "Usage: %s <port> <threads> <queue_size> <schedalg>\n", argv[0]);
         exit(1);
     }
     *port = atoi(argv[1]);
+    
     *threads = atoi(argv[2]);
+    if(*threads<1)
+        app_error("threads number must be positive");
     *queue_size = atoi(argv[3]); 
+    if(*queue_size<1)
+        app_error("queue size must be positive");
+    *sched=string_to_sched(argv[4]);
+    if(*sched==-1)
+        app_error("couldn't find schedalg name");
+
 }
 
 int main(int argc, char *argv[])
@@ -239,10 +327,14 @@ int main(int argc, char *argv[])
 
     int listenfd, connfd, port, threads, clientlen, queue_size;
     struct sockaddr_in clientaddr;
+    Sched sched;
 
-    getargs(&port, &threads, &queue_size, argc, argv);
-
+    getargs(&port, &threads, &queue_size, &sched, argc, argv);
+    if (sched==-1){
+        
+    }
     thread_pool *pool= malloc(sizeof(thread_pool));
+    pool->ids=malloc(sizeof(int) *threads);
     pool->threads = malloc(sizeof(pthread_t) * threads);
     pool->get_queue=malloc(sizeof(job_t)*queue_size);
     pool->real_queue=malloc(sizeof(job_t)*queue_size);
@@ -256,14 +348,16 @@ int main(int argc, char *argv[])
     pool->real_queue_front = 0;
     pool->real_queue_rear = 0;
     pool->vip_active = 0;
+    pool->active_jobs=0;
 
 
     pthread_mutex_init(&pool->queue_lock, NULL);
     pthread_cond_init(&pool->get_queue_not_empty, NULL);
-    pthread_cond_init(&pool->get_queue_not_full, NULL);
+    pthread_cond_init(&pool->queue_not_full, NULL);
     pthread_cond_init(&pool->real_queue_not_empty, NULL);
-    pthread_cond_init(&pool->real_queue_not_full, NULL);
-
+    for (int i = 0; i < pool->num_threads; i++) {
+        pool->ids[i]=0;
+    }
     for (int i = 0; i < pool->num_threads; i++) {
         pthread_create(&pool->threads[i], NULL, worker_thread, (void *)pool);
     }
@@ -280,16 +374,18 @@ int main(int argc, char *argv[])
 	// do the work. 
 	// 
     // only for demostration purpuse:
-        job_t job = {connfd, clientaddr};  // Example job structure
+        struct timeval arrival;
+        gettimeofday(&arrival,NULL);
+        job_t job = {connfd,arrival, clientaddr};  
         int is_vip=getRequestMetaData(connfd);
-        add_job_to_queue(pool, job,is_vip);
+        add_job_to_queue(pool, job,is_vip,sched);
         }
     free(pool->threads);
     pthread_mutex_destroy(&pool->queue_lock);
     pthread_cond_destroy(&pool->get_queue_not_empty);
-    pthread_cond_destroy(&pool->get_queue_not_full);
+    pthread_cond_destroy(&pool->queue_not_full);
     pthread_cond_destroy(&pool->real_queue_not_empty);
-    pthread_cond_destroy(&pool->real_queue_not_full);
+    pthread_cond_destroy(&pool->queue_not_full);
 
 
 }

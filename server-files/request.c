@@ -219,9 +219,8 @@ int isSkip(char *uri /*, int* est* for future use ignore this*/)
 }
 
 // handle a request
-int requestHandle(int fd, struct timeval arrival, struct timeval dispatch, threads_stats t_stats)
+void requestHandle(int fd, struct timeval arrival, struct timeval dispatch, threads_stats t_stats, int* is_skip, int *is_static)
 {
-	int is_static;
 	struct stat sbuf;
 	char buf[MAXLINE], method[MAXLINE], uri[MAXLINE], version[MAXLINE];
 	char filename[MAXLINE], cgiargs[MAXLINE];
@@ -233,32 +232,31 @@ int requestHandle(int fd, struct timeval arrival, struct timeval dispatch, threa
 
 	if (strcasecmp(method, "GET") && strcasecmp(method, "REAL")) {
 		requestError(fd, method, "501", "Not Implemented", "OS-HW3 Server does not implement this method", arrival, dispatch, t_stats);
-		return 0;
+		return ;
 	}
 
 	requestReadhdrs(&rio);
 
-	is_static = requestParseURI(uri, filename, cgiargs);
-	int is_skip=isSkip(uri);
+	*is_static = requestParseURI(uri, filename, cgiargs);
+	*is_skip=isSkip(uri);
 	if (stat(filename, &sbuf) < 0) {
 		requestError(fd, filename, "404", "Not found", "OS-HW3 Server could not find this file", arrival, dispatch, t_stats);
-		return is_skip;
+		return ;
 	}
 
-	if (is_static) {
+	if (*is_static) {
 		if (!(S_ISREG(sbuf.st_mode)) || !(S_IRUSR & sbuf.st_mode)) {
 			requestError(fd, filename, "403", "Forbidden", "OS-HW3 Server could not read this file", arrival, dispatch, t_stats);
-			return is_skip;
+			return ;
 		}
 		(t_stats->stat_req)++;
 		requestServeStatic(fd, filename, sbuf.st_size, arrival, dispatch, t_stats);
 	} else {
 		if (!(S_ISREG(sbuf.st_mode)) || !(S_IXUSR & sbuf.st_mode)) {
 			requestError(fd, filename, "403", "Forbidden", "OS-HW3 Server could not run this CGI program", arrival, dispatch, t_stats);
-			return is_skip ;
+			return  ;
 		}
 		(t_stats->dynm_req)++;
 		requestServeDynamic(fd, filename, cgiargs, arrival, dispatch, t_stats);
 	}
-	return is_skip;
 }
