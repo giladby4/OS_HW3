@@ -39,6 +39,7 @@ typedef struct {
     pthread_cond_t queue_not_full;   // Condition variable to signal when the queue is not full
     pthread_cond_t real_queue_not_empty;  // Condition variable to signal when the queue has jobs
     pthread_cond_t vip_done;     // Signal for VIP completion
+    pthread_cond_t job_done;     // Signal for VIP completion
 
 
 } thread_pool;
@@ -60,7 +61,6 @@ void printQueueState(thread_pool *pool) {
 void handle(job_t job, int *is_skip,int *is_static,int id,int count_all,int count_static){
 
         // Prepare the arrival and dispatch time structures
-        fflush(stdout);
         struct timeval curr,dispatch;
         gettimeofday(&curr,NULL);
         dispatch.tv_sec = curr.tv_sec-job.arrival.tv_sec;
@@ -70,11 +70,10 @@ void handle(job_t job, int *is_skip,int *is_static,int id,int count_all,int coun
         threads_stats t_stats = malloc(sizeof(threads_stats));  // Allocate memory for the stats
         t_stats->id = id;  // Example: Initialize with default values
         t_stats->stat_req = count_static;
-        t_stats->dynm_req = count_all-count_static-1;
+        t_stats->dynm_req = count_all-count_static;
         t_stats->total_req = count_all;
         requestHandle(job.connfd, job.arrival, dispatch, t_stats,is_skip,is_static);
 
-        fflush(stdout);
 
         free(t_stats);
         close(job.connfd);
@@ -83,7 +82,7 @@ void handle(job_t job, int *is_skip,int *is_static,int id,int count_all,int coun
 
 
 void *worker_thread(void *arg) {
-    int id=-1,count_all=1,count_static=0;
+    int id=-1,count_all=0,count_static=0;
     thread_pool *pool = (thread_pool *)arg;  // Get the thread pool from the argument
     job_t job;  // Variable to hold the job
     
@@ -151,6 +150,8 @@ void *worker_thread(void *arg) {
         }
         pthread_mutex_lock(&pool->queue_lock);
         pool->active_jobs--;  // Decrement active jobs count
+        pthread_cond_signal(&pool->job_done);
+
         pthread_mutex_unlock(&pool->queue_lock);
 
 
@@ -164,7 +165,7 @@ void *vip_worker_thread(void *arg) {
 
     thread_pool *pool = (thread_pool *)arg;
     job_t job;
-    int id,count_all=1,count_static=0;
+    int id,count_all=0,count_static=0;
     while (1) {
         // Lock the VIP queue before accessing it
         pthread_mutex_lock(&pool->queue_lock);
@@ -246,18 +247,36 @@ void add_job_to_queue(thread_pool *pool, job_t job, int is_vip, Sched sched) {
                 break;                
 
             case BF:
-                while (pool->get_queue_size > 0 || pool->real_queue_size > 0 || pool->vip_active||pool->active_jobs) {
-                    pthread_cond_wait(&pool->queue_not_full, &pool->queue_lock);
+                if (pool->get_queue_size + pool->real_queue_size == pool->max_queue_size) {
+
+                    while (pool->get_queue_size > 0 || pool->real_queue_size > 0) {
+                        pthread_cond_wait(&pool->queue_not_full, &pool->queue_lock);
+                        while(pool->vip_active)
+                            pthread_cond_wait(&pool->vip_done, &pool->queue_lock);
+                        while(pool->active_jobs)
+                            pthread_cond_wait(&pool->job_done, &pool->queue_lock);
+                    }
+                    close(job.connfd);  // Drop the new request
+                    pthread_mutex_unlock(&pool->queue_lock);
+                    return;  // No new request is added
                 }
-                close(job.connfd);  // Drop the new request
-                pthread_mutex_unlock(&pool->queue_lock);
-                return;  // No new request is added
                 break;
 
             case RANDOM:
-                while (pool->get_queue_size+pool->real_queue_size == pool->max_queue_size) {
-                    pthread_cond_wait(&pool->queue_not_full, &pool->queue_lock);
-                }
+                if (pool->get_queue_size + pool->real_queue_size == pool->max_queue_size) {
+                    int drop_count = (pool->get_queue_size+1 ) / 2;  // Calculate how many jobs to drop
+                    for (int i = 0; i < drop_count; i++) {
+                        int drop_index = (pool->get_queue_front + rand() % pool->get_queue_size) % pool->max_queue_size;
+                        // Shift elements to overwrite the dropped job
+                        close( pool->get_queue[drop_index].connfd);
+
+                        for (int j = drop_index; j != pool->get_queue_rear; j = (j + 1) % pool->max_queue_size) {
+                            pool->get_queue[j] = pool->get_queue[(j + 1) % pool->max_queue_size];
+                        }
+                        pool->get_queue_rear = (pool->get_queue_rear - 1 + pool->max_queue_size) % pool->max_queue_size;
+                        pool->get_queue_size--;  // Decrease queue size
+                    }
+                }                
                 break;
             default:
                 pthread_mutex_unlock(&pool->queue_lock);
@@ -311,14 +330,22 @@ void getargs(int *port, int *threads, int *queue_size, Sched *sched, int argc, c
     *port = atoi(argv[1]);
     
     *threads = atoi(argv[2]);
-    if(*threads<1)
+    if(*threads<1){
         app_error("threads number must be positive");
+        exit(1);
+    }
     *queue_size = atoi(argv[3]); 
-    if(*queue_size<1)
+    if(*queue_size<1){
         app_error("queue size must be positive");
+        exit(1);
+    }
     *sched=string_to_sched(argv[4]);
-    if(*sched==-1)
+    if(*sched==-1){
         app_error("couldn't find schedalg name");
+        exit(1);
+    }
+    
+
 
 }
 
@@ -355,6 +382,9 @@ int main(int argc, char *argv[])
     pthread_cond_init(&pool->get_queue_not_empty, NULL);
     pthread_cond_init(&pool->queue_not_full, NULL);
     pthread_cond_init(&pool->real_queue_not_empty, NULL);
+    pthread_cond_init(&pool->job_done, NULL);
+    pthread_cond_init(&pool->vip_done, NULL);
+
     for (int i = 0; i < pool->num_threads; i++) {
         pool->ids[i]=0;
     }
@@ -385,7 +415,9 @@ int main(int argc, char *argv[])
     pthread_cond_destroy(&pool->get_queue_not_empty);
     pthread_cond_destroy(&pool->queue_not_full);
     pthread_cond_destroy(&pool->real_queue_not_empty);
-    pthread_cond_destroy(&pool->queue_not_full);
+    pthread_cond_destroy(&pool->job_done);
+    pthread_cond_destroy(&pool->vip_done);
+
 
 
 }
